@@ -1,15 +1,22 @@
+
 import base64
 import json
 import math
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from threading import Lock
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.responses import JSONResponse, Response
+
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
 
 TOTAL_ORDERS = 50
 RATE_LIMIT = 19
@@ -26,69 +33,122 @@ app.add_middleware(
     expose_headers=["Retry-After"],
 )
 
-# In-memory state for idempotency and per-client rate limits.
-idempotency_store: dict[str, dict[str, Any]] = {}
-client_requests = defaultdict(deque)
-state_lock = Lock()
 
+# --------------------------------------------------
+# In-memory stores
+# --------------------------------------------------
+
+# Idempotency key -> original response.
+idempotency_store: dict[str, dict[str, Any]] = {}
+
+# Client ID -> timestamps of requests within the window.
+client_requests: dict[str, deque[float]] = defaultdict(deque)
+
+# Protect shared dictionaries and queues.
+store_lock = threading.Lock()
+
+
+# --------------------------------------------------
+# Request model
+# --------------------------------------------------
 
 class OrderRequest(BaseModel):
-    model_config = {"extra": "allow"}
+    model_config = ConfigDict(extra="allow")
+
     item: str = "order"
     quantity: int = Field(default=1, ge=1)
 
 
+# --------------------------------------------------
+# Per-client rate limiting
+# --------------------------------------------------
+
+@app.middleware("http")
+async def per_client_rate_limit(
+    request: Request,
+    call_next,
+):
+    # CORS preflight must not consume rate-limit capacity.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # Do not put all unidentified clients into one shared bucket.
+    client_id = request.headers.get("X-Client-Id")
+
+    if client_id is None or not client_id.strip():
+        return await call_next(request)
+
+    client_id = client_id.strip()
+    now = time.monotonic()
+
+    with store_lock:
+        timestamps = client_requests[client_id]
+
+        # Remove requests outside the sliding time window.
+        while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
+            timestamps.popleft()
+
+        if len(timestamps) >= RATE_LIMIT:
+            retry_after = max(
+                1,
+                math.ceil(
+                    WINDOW_SECONDS - (now - timestamps[0])
+                ),
+            )
+
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        timestamps.append(now)
+
+    return await call_next(request)
+
+
+# --------------------------------------------------
+# Cursor encoding and decoding
+# --------------------------------------------------
+
 def encode_cursor(last_id: int) -> str:
-    raw = json.dumps({"after": last_id}, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    payload = json.dumps(
+        {"after": last_id},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
 def decode_cursor(cursor: str) -> int:
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded).decode())
-        after = payload["after"]
-        if not isinstance(after, int) or not 0 <= after <= TOTAL_ORDERS:
-            raise ValueError
-        return after
+        payload = base64.urlsafe_b64decode(padded.encode("ascii"))
+        data = json.loads(payload.decode("utf-8"))
+
+        last_id = data["after"]
+
+        if isinstance(last_id, bool) or not isinstance(last_id, int):
+            raise ValueError("Invalid cursor position")
+
+        if last_id < 0 or last_id > TOTAL_ORDERS:
+            raise ValueError("Cursor position out of range")
+
+        return last_id
+
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid cursor",
+        )
 
 
-@app.middleware("http")
-async def per_client_rate_limit(request: Request, call_next):
-    # CORS preflight must be allowed through without consuming a request.
-    if request.method == "OPTIONS":
-        return await call_next(request)
-
-    client_id = request.headers.get("X-Client-Id", "anonymous").strip()
-    if not client_id:
-        client_id = "anonymous"
-
-    now = time.monotonic()
-    with state_lock:
-        bucket = client_requests[client_id]
-        while bucket and now - bucket[0] >= WINDOW_SECONDS:
-            bucket.popleft()
-
-        if len(bucket) >= RATE_LIMIT:
-            retry_after = max(
-                1, math.ceil(WINDOW_SECONDS - (now - bucket[0]))
-            )
-            return Response(
-                content=json.dumps({"detail": "Rate limit exceeded"}),
-                status_code=429,
-                media_type="application/json",
-                headers={"Retry-After": str(retry_after)},
-            )
-
-        bucket.append(now)
-
-    return await call_next(request)
-
+# --------------------------------------------------
+# Health endpoint
+# --------------------------------------------------
 
 @app.get("/")
-def home():
+async def root():
     return {
         "status": "ok",
         "service": "orders-api-engineering",
@@ -98,40 +158,76 @@ def home():
     }
 
 
-@app.post("/orders", status_code=201)
-def create_order(
-    order: OrderRequest,
-    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
-):
-    key = idempotency_key.strip()
-    if not key:
-        raise HTTPException(status_code=422, detail="Idempotency-Key is required")
+# --------------------------------------------------
+# Create order with idempotency
+# --------------------------------------------------
 
-    with state_lock:
+@app.post("/orders", status_code=201)
+async def create_order(
+    order: OrderRequest,
+    idempotency_key: Optional[str] = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+):
+    if idempotency_key is None or not idempotency_key.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header is required",
+        )
+
+    key = idempotency_key.strip()
+    order_data = order.model_dump()
+
+    with store_lock:
+        # A repeated key returns the exact original response.
         if key in idempotency_store:
-            return idempotency_store[key]
+            return JSONResponse(
+                status_code=201,
+                content=idempotency_store[key],
+            )
 
         result = {
             "id": str(uuid.uuid4()),
-            **order.model_dump(),
+            **order_data,
         }
-        idempotency_store[key] = result
-        return result
 
+        idempotency_store[key] = result
+
+    return JSONResponse(
+        status_code=201,
+        content=result,
+    )
+
+
+# --------------------------------------------------
+# Cursor-paginated fixed catalog, IDs 1 through 50
+# --------------------------------------------------
 
 @app.get("/orders")
-def list_orders(limit: int = 10, cursor: str | None = None):
-    if not 1 <= limit <= TOTAL_ORDERS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"limit must be between 1 and {TOTAL_ORDERS}",
-        )
+async def list_orders(
+    limit: int = Query(default=10, ge=1),
+    cursor: Optional[str] = Query(default=None),
+):
+    if cursor:
+        last_id = decode_cursor(cursor)
+    else:
+        last_id = 0
 
-    after = decode_cursor(cursor) if cursor else 0
-    ids = list(range(after + 1, min(after + limit, TOTAL_ORDERS) + 1))
-    items = [{"id": order_id} for order_id in ids]
+    # The fixed catalog consists of IDs 1 through 50.
+    start_id = last_id + 1
+    end_id = min(last_id + limit, TOTAL_ORDERS)
 
-    next_cursor = encode_cursor(ids[-1]) if ids and ids[-1] < TOTAL_ORDERS else None
+    items = (
+        [{"id": order_id} for order_id in range(start_id, end_id + 1)]
+        if start_id <= TOTAL_ORDERS
+        else []
+    )
+
+    if items and end_id < TOTAL_ORDERS:
+        next_cursor = encode_cursor(end_id)
+    else:
+        next_cursor = None
 
     return {
         "items": items,
